@@ -2,31 +2,88 @@ import asyncio
 import json
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="open-terminal")
+from open_terminal.env import API_KEY
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def verify_api_key(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+):
+    if not API_KEY:
+        return
+    if not credentials or credentials.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+app = FastAPI(
+    title="Open Terminal",
+    description="Shell command execution API with synchronous and streaming support.",
+    version="0.1.3",
+    dependencies=[Depends(verify_api_key)],
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ExecRequest(BaseModel):
-    command: str
-    timeout: Optional[float] = 30.0
+    command: str = Field(
+        ...,
+        description="Shell command to execute. Supports chaining (&&, ||, ;), pipes (|), and redirections.",
+        json_schema_extra={"examples": ["echo hello", "ls -la && whoami"]},
+    )
+    timeout: Optional[float] = Field(
+        30.0,
+        description="Max execution time in seconds. Process is killed if exceeded (exit_code: -1). Null to disable.",
+        ge=0,
+    )
 
 
 class ExecResponse(BaseModel):
-    exit_code: int
-    stdout: str
-    stderr: str
+    exit_code: int = Field(
+        ...,
+        description="Process exit code. 0 = success, non-zero = error, -1 = timeout.",
+    )
+    stdout: str = Field(..., description="Captured standard output.")
+    stderr: str = Field(..., description="Captured standard error.")
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    summary="Health check",
+    description="Returns service status. No authentication required.",
+)
 async def health():
     return {"status": "ok"}
 
 
-@app.post("/execute")
-async def execute(req: ExecRequest, stream: bool = False):
+@app.post(
+    "/execute",
+    summary="Execute a command",
+    description="Run a shell command and return the result.",
+    response_model=ExecResponse,
+    responses={
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def execute(
+    req: ExecRequest,
+    stream: bool = Query(
+        False,
+        description="Stream output as JSONL (application/x-ndjson) instead of waiting for completion.",
+    ),
+):
     if stream:
         return _stream_response(req)
 
@@ -36,9 +93,7 @@ async def execute(req: ExecRequest, stream: bool = False):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=req.timeout
-        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=req.timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
@@ -65,7 +120,9 @@ def _stream_response(req: ExecRequest):
 
         async def read_stream(s, label):
             async for line in s:
-                yield json.dumps({"type": label, "data": line.decode(errors="replace")}) + "\n"
+                yield json.dumps(
+                    {"type": label, "data": line.decode(errors="replace")}
+                ) + "\n"
 
         async for chunk in read_stream(proc.stdout, "stdout"):
             yield chunk
