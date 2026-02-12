@@ -18,19 +18,16 @@ from open_terminal.env import API_KEY
 def get_system_info() -> str:
     """Gather runtime system metadata for the OpenAPI description."""
     shell = os.environ.get("SHELL", "/bin/sh")
-    lines = [
-        f"- **OS:** {platform.system()} {platform.release()} ({platform.machine()})",
-        f"- **Hostname:** {socket.gethostname()}",
-        f"- **Shell:** {shell}",
-        f"- **Python:** {sys.version.split()[0]}",
-        f"- **Working Directory:** {os.getcwd()}",
-    ]
-    return "\n".join(lines)
+    return (
+        f"This system is running {platform.system()} {platform.release()} ({platform.machine()}) "
+        f"on {socket.gethostname()} as user '{os.getenv('USER', 'unknown')}' with {shell}. "
+        f"Python {sys.version.split()[0]} is available. "
+        f"The working directory is {os.getcwd()}."
+    )
 
 
 _EXECUTE_DESCRIPTION = (
     "Run a shell command and return the result.\n\n"
-    "**Environment:**\n"
     + get_system_info()
 )
 

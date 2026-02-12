@@ -1,6 +1,6 @@
 [project]
 name = "open-terminal"
-version = "0.1.9"
+version = "0.1.10"
 description = "A minimal terminal interaction API"
 readme = "README.md"
 authors = [
