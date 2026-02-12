@@ -65,13 +65,13 @@ Output streams as JSONL:
 
 **From URL:**
 ```bash
-curl -X POST "http://localhost:8000/files/upload?url=https://example.com/data.csv&path=/tmp/data.csv" \
+curl -X POST "http://localhost:8000/files/upload?url=https://example.com/data.csv&dir=/tmp" \
   -H "Authorization: Bearer <api-key>"
 ```
 
 **Direct upload:**
 ```bash
-curl -X POST "http://localhost:8000/files/upload?path=/tmp/data.csv" \
+curl -X POST "http://localhost:8000/files/upload?dir=/tmp" \
   -H "Authorization: Bearer <api-key>" \
   -F "file=@local_file.csv"
 ```
@@ -79,7 +79,7 @@ curl -X POST "http://localhost:8000/files/upload?path=/tmp/data.csv" \
 **Via temporary link (no auth needed to upload):**
 ```bash
 # 1. Generate an upload link
-curl -X POST "http://localhost:8000/files/upload/link?path=/tmp/data.csv" \
+curl -X POST "http://localhost:8000/files/upload/link?dir=/tmp" \
   -H "Authorization: Bearer <api-key>"
 # → {"url": "http://localhost:8000/files/upload/a1b2c3d4..."}
 
@@ -87,6 +87,8 @@ curl -X POST "http://localhost:8000/files/upload/link?path=/tmp/data.csv" \
 curl -X POST "http://localhost:8000/files/upload/a1b2c3d4..." \
   -F "file=@local_file.csv"
 ```
+
+Filename is automatically derived from the uploaded file or URL.
 
 ### Download a File
 

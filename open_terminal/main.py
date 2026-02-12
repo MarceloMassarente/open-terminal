@@ -132,23 +132,27 @@ async def download_file(token: str):
     },
 )
 async def upload_file(
-    path: str = Query(..., description="Absolute destination path for the file."),
+    dir: str = Query(..., description="Destination directory for the file."),
     url: Optional[str] = Query(None, description="URL to download the file from. If omitted, expects a multipart file upload."),
     file: Optional[UploadFile] = File(None, description="The file to upload (if no URL provided)."),
 ):
     if url:
         import httpx
+        from urllib.parse import urlparse
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(url)
             resp.raise_for_status()
         content = resp.content
+        filename = os.path.basename(urlparse(url).path) or "download"
     elif file:
         content = await file.read()
+        filename = file.filename or "upload"
     else:
         raise HTTPException(status_code=400, detail="Provide either 'url' or a file upload.")
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(dir, exist_ok=True)
+    path = os.path.join(dir, filename)
     with open(path, "wb") as f:
         f.write(content)
     return {"path": path, "size": len(content)}
@@ -164,14 +168,14 @@ async def upload_file(
     },
 )
 async def create_upload_link(
-    path: str = Query(..., description="Absolute destination path for the uploaded file."),
+    dir: str = Query(..., description="Destination directory for the uploaded file."),
     request: Request = None,
 ):
     import time
     import uuid
 
     token = uuid.uuid4().hex
-    _upload_links[token] = (path, time.time() + 300)
+    _upload_links[token] = (dir, time.time() + 300)
 
     base_url = str(request.base_url).rstrip("/")
     return {"url": f"{base_url}/files/upload/{token}"}
@@ -211,11 +215,13 @@ async def upload_file_via_link(
     if not entry:
         raise HTTPException(status_code=404, detail="Invalid or expired upload link")
 
-    path, expiry = entry
+    dir, expiry = entry
     if time.time() > expiry:
         raise HTTPException(status_code=404, detail="Upload link expired")
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    filename = file.filename or "upload"
+    os.makedirs(dir, exist_ok=True)
+    path = os.path.join(dir, filename)
     content = await file.read()
     with open(path, "wb") as f:
         f.write(content)
