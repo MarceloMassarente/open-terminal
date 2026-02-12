@@ -19,6 +19,19 @@ docker build -t open-terminal .
 docker run -p 8000:8000 open-terminal
 ```
 
+### Bare Metal (if you like to live dangerously)
+
+```bash
+pip install open-terminal
+open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
+```
+
+| Option | Default | Env Var | Description |
+|---|---|---|---|
+| `--host` | `0.0.0.0` | — | Bind address |
+| `--port` | `8000` | — | Bind port |
+| `--api-key` | auto-generated | `OPEN_TERMINAL_API_KEY` | Bearer API key |
+
 ## Usage
 
 ### Run a Command
