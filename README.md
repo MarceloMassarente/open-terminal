@@ -7,10 +7,10 @@ A lightweight API for running shell commands remotely — with real-time streami
 ### Docker (recommended)
 
 ```bash
-docker run -p 8000:8000 -e OPEN_TERMINAL_API_KEY=your-secret-key ghcr.io/open-webui/open-terminal
+docker run -d --name open-terminal --restart unless-stopped -p 8000:8000 -e OPEN_TERMINAL_API_KEY=your-secret-key ghcr.io/open-webui/open-terminal
 ```
 
-If no API key is provided, one is auto-generated and printed on startup.
+If no API key is provided, one is auto-generated and printed on startup (`docker logs open-terminal`).
 
 ### Build from Source
 
