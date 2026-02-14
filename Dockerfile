@@ -39,6 +39,9 @@ RUN pip install --no-cache-dir \
 COPY . .
 RUN pip install --no-cache-dir .
 
+RUN mkdir -p /mnt/data
+WORKDIR /mnt/data
+
 EXPOSE 8000
 
 ENTRYPOINT ["open-terminal"]
