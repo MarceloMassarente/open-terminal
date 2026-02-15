@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] - 2026-02-15
+
+### Fixed
+
+- 🛡️ **Null query parameter tolerance** via HTTP middleware that strips query parameters with the literal value `"null"`. Prevents 422 errors when clients serialize `null` into query strings (e.g. `?wait=null`) instead of omitting the parameter.
+
 ## [0.2.1] - 2026-02-14
 
 ### Added
