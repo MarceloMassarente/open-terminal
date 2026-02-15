@@ -39,8 +39,9 @@ RUN pip install --no-cache-dir \
 COPY . .
 RUN pip install --no-cache-dir .
 
-RUN mkdir -p /mnt/data
-WORKDIR /mnt/data
+RUN useradd -m user && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+USER user
+WORKDIR /home/user
 
 EXPOSE 8000
 
