@@ -50,5 +50,29 @@ def run(host: str, port: int, api_key: str):
     uvicorn.run("open_terminal.main:app", host=host, port=port)
 
 
+@main.command()
+@click.option(
+    "--transport",
+    default="stdio",
+    type=click.Choice(["stdio", "streamable-http"]),
+    help="MCP transport (default: stdio)",
+)
+@click.option("--host", default="0.0.0.0", help="Bind host (streamable-http only)")
+@click.option("--port", default=8000, type=int, help="Bind port (streamable-http only)")
+def mcp(transport: str, host: str, port: int):
+    """Start the MCP server (requires 'pip install open-terminal[mcp]')."""
+    try:
+        from open_terminal.mcp_server import mcp as mcp_server
+    except ImportError:
+        click.echo(
+            "Missing MCP dependencies. Install with:\n"
+            "  pip install open-terminal[mcp]",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    mcp_server.run(transport=transport, host=host, port=port)
+
+
 if __name__ == "__main__":
     main()

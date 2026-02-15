@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] - 2026-02-15
+
+### Added
+
+- 🤖 **Optional MCP server mode** via `open-terminal mcp`, exposing all endpoints as MCP tools for LLM agent integration. Supports `stdio` and `streamable-http` transports. Install with `pip install open-terminal[mcp]`.
+
 ## [0.2.2] - 2026-02-15
 
 ### Fixed

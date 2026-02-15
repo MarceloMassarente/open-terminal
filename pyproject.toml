@@ -1,6 +1,6 @@
 [project]
 name = "open-terminal"
-version = "0.2.2"
+version = "0.2.3"
 description = "A remote terminal API."
 readme = "README.md"
 authors = [
@@ -15,6 +15,9 @@ dependencies = [
     "python-multipart>=0.0.22",
     "aiofiles>=25.1.0",
 ]
+
+[project.optional-dependencies]
+mcp = ["fastmcp>=2.0.0"]
 
 [project.scripts]
 open-terminal = "open_terminal.cli:main"
