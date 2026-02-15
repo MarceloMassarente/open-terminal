@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import fnmatch
 import os
 import platform
+import re
 import signal
 import socket
 import sys
@@ -366,6 +368,92 @@ async def replace_file_content(request: ReplaceRequest):
         output_file.write(content)
 
     return {"path": target, "size": len(content.encode())}
+
+
+@app.get(
+    "/files/search",
+    operation_id="search_files",
+    summary="Search file contents",
+    description="Search for a text pattern across files in a directory. Returns structured matches with file paths, line numbers, and matching lines. Skips binary files.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        404: {"description": "Search path not found."},
+        400: {"description": "Invalid regex pattern."},
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def search_files(
+    query: str = Query(..., description="Text or regex pattern to search for."),
+    path: str = Query(".", description="Directory or file to search in."),
+    regex: bool = Query(False, description="Treat query as a regex pattern."),
+    case_insensitive: bool = Query(False, description="Perform case-insensitive matching."),
+    include: Optional[list[str]] = Query(None, description="Glob patterns to filter files (e.g. '*.py'). Files must match at least one pattern."),
+    match_per_line: bool = Query(True, description="If true, return each matching line with line numbers. If false, return only the names of matching files."),
+    max_results: int = Query(50, description="Maximum number of matches to return.", ge=1, le=500),
+):
+    target = os.path.abspath(path)
+    if not os.path.exists(target):
+        raise HTTPException(status_code=404, detail="Search path not found")
+
+    flags = re.IGNORECASE if case_insensitive else 0
+    if regex:
+        try:
+            pattern = re.compile(query, flags)
+        except re.error as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid regex: {exc}")
+    else:
+        pattern = re.compile(re.escape(query), flags)
+
+    def _matches_include(filename: str) -> bool:
+        if not include:
+            return True
+        return any(fnmatch.fnmatch(filename, glob) for glob in include)
+
+    matches = []
+    truncated = False
+
+    def _search_file(file_path: str):
+        nonlocal truncated
+        if truncated:
+            return
+        try:
+            with open(file_path, "r", errors="strict") as f:
+                for line_number, line in enumerate(f, 1):
+                    if pattern.search(line):
+                        if match_per_line:
+                            matches.append({
+                                "file": file_path,
+                                "line": line_number,
+                                "content": line.rstrip("\n\r"),
+                            })
+                            if len(matches) >= max_results:
+                                truncated = True
+                                return
+                        else:
+                            matches.append({"file": file_path})
+                            if len(matches) >= max_results:
+                                truncated = True
+                            return  # one match per file is enough
+        except (UnicodeDecodeError, ValueError, OSError):
+            pass  # skip binary or unreadable files
+
+    if os.path.isfile(target):
+        _search_file(target)
+    else:
+        for dirpath, _, filenames in os.walk(target):
+            if truncated:
+                break
+            for filename in sorted(filenames):
+                if not _matches_include(filename):
+                    continue
+                _search_file(os.path.join(dirpath, filename))
+
+    return {
+        "query": query,
+        "path": target,
+        "matches": matches,
+        "truncated": truncated,
+    }
 
 
 # Temporary links: {token: (path, expiry_timestamp)}
