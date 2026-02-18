@@ -24,6 +24,10 @@ docker run -p 8000:8000 open-terminal
 ### Bare Metal
 
 ```bash
+# One-liner with uvx (no install needed)
+uvx open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
+
+# Or install globally with pip
 pip install open-terminal
 open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
 ```
