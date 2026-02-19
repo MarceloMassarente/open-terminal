@@ -56,7 +56,7 @@ async def verify_api_key(
 app = FastAPI(
     title="Open Terminal",
     description="A remote terminal API.",
-    version="0.2.3",
+    version="0.2.4",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -317,7 +317,6 @@ async def health():
 )
 async def list_files(
     directory: str = Query(".", description="Directory path to list."),
-    max_entries: int = Query(500, description="Maximum entries to return.", ge=1, le=5000),
 ):
     target = os.path.abspath(directory)
     if not await aiofiles.os.path.isdir(target):
@@ -325,11 +324,7 @@ async def list_files(
 
     def _list_sync():
         entries = []
-        truncated = False
         for name in sorted(os.listdir(target)):
-            if len(entries) >= max_entries:
-                truncated = True
-                break
             full_path = os.path.join(target, name)
             try:
                 file_stat = os.stat(full_path)
@@ -343,10 +338,10 @@ async def list_files(
                 )
             except OSError:
                 continue
-        return entries, truncated
+        return entries
 
-    entries, truncated = await asyncio.to_thread(_list_sync)
-    return {"dir": target, "entries": entries, "truncated": truncated}
+    entries = await asyncio.to_thread(_list_sync)
+    return {"dir": target, "entries": entries}
 
 
 @app.get(

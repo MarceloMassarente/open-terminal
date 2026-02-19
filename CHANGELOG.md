@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.4] - 2026-02-19
+
+### Changed
+
+- ⚡ **Fully async I/O** across all file and upload endpoints. Replaced blocking `os.*` and `open()` calls with `aiofiles` and `aiofiles.os` so the event loop is never blocked by filesystem operations. `search_files` and `list_files` inner loops use `asyncio.to_thread` for `os.walk`/`os.listdir` workloads.
+
 ## [0.2.3] - 2026-02-15
 
 ### Added
