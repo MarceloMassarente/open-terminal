@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  open-terminal:
+    build:
+      context: .
+    container_name: open-terminal-app
+    ports:
+      # Usando uma porta aleatória no Ubuntu (9777) mapeada para a 8000 do container
+      - "9777:8000"
+    restart: unless-stopped
+    networks:
+      - rede_compartilhada
+
+networks:
+  rede_compartilhada:
+    external: true
+    name: openwebui-hibrido_openwebui_network
