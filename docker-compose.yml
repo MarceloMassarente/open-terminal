@@ -6,13 +6,35 @@ services:
       context: .
     container_name: open-terminal-app
     ports:
-      # Usando uma porta aleatória no Ubuntu (9777) mapeada para a 8000 do container
       - "9777:8000"
     restart: unless-stopped
+    
+    # 1. Configuração de Rede (Mantemos a conexão com o Open WebUI)
     networks:
       - rede_compartilhada
+      
+    # 2. Configuração de Volume (Para não perder seus arquivos)
+    volumes:
+      - dados_terminal:/home/user
+      
+    # 3. Chave de Segurança (Mude 'sua_senha_secreta_aqui' para uma senha forte)
+    environment:
+      - OPEN_TERMINAL_API_KEY=sua_senha_secreta_aqui
+      
+    # 4. Limites de Recursos (Evita que o terminal trave seu servidor Ubuntu)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
 
+# Declaração da rede externa que já existe no seu Portainer
 networks:
   rede_compartilhada:
     external: true
     name: openwebui-hibrido_openwebui_network
+
+# Declaração do volume que guardará os dados permanentemente
+volumes:
+  dados_terminal:
+    name: open-terminal-data
