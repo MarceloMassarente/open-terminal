@@ -16,9 +16,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Scripting & languages
     perl ruby-full lua5.4 \
     # Data processing
-    jq xmlstarlet sqlite3 \
+    jq xmlstarlet sqlite3 csvkit miller \
+    postgresql-client default-mysql-client redis-tools \
     # Media & documents
     ffmpeg pandoc imagemagick \
+    poppler-utils tesseract-ocr qpdf ghostscript libreoffice \
+    graphviz \
+    # Scientific and geospatial native deps
+    gfortran libopenblas-dev liblapack-dev \
+    gdal-bin libgdal-dev \
+    # Developer tooling
+    shellcheck ripgrep fd-find fzf \
     # Compression
     zip unzip tar gzip bzip2 xz-utils zstd p7zip-full \
     # System
@@ -30,16 +38,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Node.js (LTS)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g npm@latest yarn pnpm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
     numpy pandas scipy scikit-learn \
+    polars pyarrow statsmodels xgboost lightgbm catboost \
     matplotlib seaborn plotly \
+    bokeh altair \
     jupyter ipython \
+    jupyterlab notebook \
     requests beautifulsoup4 lxml \
     sqlalchemy psycopg2-binary \
+    pymysql redis pymongo duckdb \
+    openpyxl xlsxwriter odfpy python-docx reportlab \
+    pdfplumber pypdf pdf2image pytesseract \
+    opencv-python-headless pillow \
+    shapely geopandas folium \
+    networkx sympy \
+    fastparquet tabulate \
     pyyaml toml jsonlines \
     tqdm rich
 
