@@ -52,5 +52,7 @@ WORKDIR /home/user
 
 EXPOSE 8000
 
-ENTRYPOINT ["open-terminal"]
+COPY entrypoint.sh /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["run"]
