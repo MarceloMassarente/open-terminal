@@ -1,6 +1,6 @@
 [project]
 name = "open-terminal"
-version = "0.5.0"
+version = "0.6.0"
 description = "A remote terminal API."
 readme = "README.md"
 authors = [

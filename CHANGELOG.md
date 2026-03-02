@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-03-02
+
+### Added
+
+- 📄 **Configuration file support** — settings can now be loaded from TOML config files at /etc/open-terminal/config.toml (system-wide) and $XDG_CONFIG_HOME/open-terminal/config.toml (per-user, defaults to ~/.config/open-terminal/config.toml). Supports host, port, api_key, cors_allowed_origins, log_dir, and binary_mime_prefixes. CLI flags and environment variables still take precedence. Use --config to point to a custom config file. This keeps the API key out of ps / htop output.
+
 ## [0.5.0] - 2026-03-02
 
 ### Changed

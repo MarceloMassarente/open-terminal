@@ -50,6 +50,36 @@ open-terminal run --host 0.0.0.0 --port 8000 --api-key your-secret-key
 > On bare metal, commands run directly on your machine with your user's permissions. Use Docker if you want sandboxed execution.
 
 
+## Configuration
+
+Open Terminal can be configured via a TOML config file, environment variables, and CLI flags. Settings are resolved in this order (highest priority wins):
+
+1. **CLI flags** (`--host`, `--port`, `--api-key`, etc.)
+2. **Environment variables** (`OPEN_TERMINAL_API_KEY`, etc.)
+3. **User config** — `$XDG_CONFIG_HOME/open-terminal/config.toml` (defaults to `~/.config/open-terminal/config.toml`)
+4. **System config** — `/etc/open-terminal/config.toml`
+5. **Built-in defaults**
+
+Create a config file at either location with any of these keys (all optional):
+
+```toml
+host = "0.0.0.0"
+port = 8000
+api_key = "sk-my-secret-key"
+cors_allowed_origins = "*"
+log_dir = "/var/log/open-terminal"
+binary_mime_prefixes = "image,audio"
+```
+
+> [!TIP]
+> Use the system config at `/etc/open-terminal/config.toml` to set site-wide defaults for host and port, and the user config for personal settings like the API key — this keeps the key out of `ps` / `htop`.
+
+You can also point to a specific config file:
+
+```bash
+open-terminal run --config /path/to/my-config.toml
+```
+
 ## Using with Open WebUI
 
 Open Terminal integrates with [Open WebUI](https://github.com/open-webui/open-webui), giving your AI assistants the ability to run commands, manage files, and interact with a terminal right from the AI interface. Make sure to add it under **Open Terminal** in the integrations settings, not as a tool server. Adding it as an Open Terminal connection gives you a built-in file navigation sidebar where you can browse directories, upload, download, and edit files. There are two ways to connect:

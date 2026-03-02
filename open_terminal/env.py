@@ -1,5 +1,7 @@
 import os
 
+from open_terminal import config
+
 
 def _resolve_file_env(var: str, default: str = "") -> str:
     """Resolve an environment variable with Docker-secrets ``_FILE`` support.
@@ -26,17 +28,23 @@ def _resolve_file_env(var: str, default: str = "") -> str:
     return value or default
 
 
-API_KEY = _resolve_file_env("OPEN_TERMINAL_API_KEY")
-CORS_ALLOWED_ORIGINS = os.environ.get("OPEN_TERMINAL_CORS_ALLOWED_ORIGINS", "*")
+API_KEY = _resolve_file_env("OPEN_TERMINAL_API_KEY", config.get("api_key", ""))
+CORS_ALLOWED_ORIGINS = os.environ.get(
+    "OPEN_TERMINAL_CORS_ALLOWED_ORIGINS",
+    config.get("cors_allowed_origins", "*"),
+)
 LOG_DIR = os.environ.get(
     "OPEN_TERMINAL_LOG_DIR",
-    os.path.join(
-        os.environ.get(
-            "XDG_STATE_HOME",
-            os.path.join(os.path.expanduser("~"), ".local", "state"),
+    config.get(
+        "log_dir",
+        os.path.join(
+            os.environ.get(
+                "XDG_STATE_HOME",
+                os.path.join(os.path.expanduser("~"), ".local", "state"),
+            ),
+            "open-terminal",
+            "logs",
         ),
-        "open-terminal",
-        "logs",
     ),
 )
 
@@ -44,6 +52,9 @@ LOG_DIR = os.environ.get(
 # as raw binary responses (e.g. "image,audio" or "image/png,image/jpeg").
 BINARY_FILE_MIME_PREFIXES = [
     p.strip()
-    for p in os.environ.get("OPEN_TERMINAL_BINARY_MIME_PREFIXES", "image").split(",")
+    for p in os.environ.get(
+        "OPEN_TERMINAL_BINARY_MIME_PREFIXES",
+        config.get("binary_mime_prefixes", "image"),
+    ).split(",")
     if p.strip()
 ]
