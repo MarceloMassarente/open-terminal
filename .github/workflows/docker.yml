@@ -3,7 +3,6 @@ name: Build Docker Image
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -77,6 +76,28 @@ jobs:
       packages: write
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2)
+          echo "major_minor=$MAJOR_MINOR" >> "$GITHUB_OUTPUT"
+          if git rev-parse "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            TAG_SHA=$(git rev-list -n 1 "v$VERSION")
+            if [ "$TAG_SHA" = "${{ github.sha }}" ]; then
+              echo "is_new_version=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_new_version=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "is_new_version=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
@@ -97,9 +118,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.is_new_version }}
+            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ steps.version.outputs.is_new_version }}
             type=sha
 
       - name: Create manifest list and push

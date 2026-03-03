@@ -1,3 +1,5 @@
+import os
+
 import click
 import uvicorn
 
@@ -21,24 +23,73 @@ BANNER = r"""
 
 
 @main.command()
-@click.option("--host", default="0.0.0.0", help="Bind host")
-@click.option("--port", default=8000, type=int, help="Bind port")
+@click.option("--host", default=None, help="Bind host (default: 0.0.0.0)")
+@click.option("--port", default=None, type=int, help="Bind port (default: 8000)")
+@click.option(
+    "--config",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+    help="Path to a TOML config file (overrides user-level config location).",
+)
+@click.option(
+    "--cwd",
+    type=click.Path(exists=True, file_okay=False, resolve_path=True, path_type=str),
+    default=None,
+    help="Working directory for the server process.",
+)
 @click.option(
     "--api-key",
     default="",
     envvar="OPEN_TERMINAL_API_KEY",
     help="Bearer API key (or set OPEN_TERMINAL_API_KEY env var)",
 )
-def run(host: str, port: int, api_key: str):
+@click.option(
+    "--cors-allowed-origins",
+    default="*",
+    envvar="OPEN_TERMINAL_CORS_ALLOWED_ORIGINS",
+    help="Allowed CORS origins, comma-separated (default: * for all)",
+)
+def run(
+    host: str | None,
+    port: int | None,
+    config_path: str | None,
+    cwd: str | None,
+    api_key: str,
+    cors_allowed_origins: str,
+):
     """Start the sandbox API server."""
-    import os
     import secrets
+
+    from open_terminal import config
+
+    # Load config files before resolving other settings.
+    cfg = config.init(config_path)
+
+    # Resolve host/port: CLI flag > config file > built-in default
+    host = host or cfg.get("host", "0.0.0.0")
+    port = port if port is not None else cfg.get("port", 8000)
+
+    if cwd:
+        os.chdir(cwd)
+
+    # Support Docker secrets: load from _FILE variant if no key was given
+    if not api_key:
+        file_path = os.environ.get("OPEN_TERMINAL_API_KEY_FILE")
+        if file_path:
+            with open(file_path) as f:
+                api_key = f.read().strip()
+
+    # Fall back to config file value
+    if not api_key:
+        api_key = cfg.get("api_key", "")
 
     generated = not api_key
     if not api_key:
         api_key = secrets.token_urlsafe(24)
 
     os.environ["OPEN_TERMINAL_API_KEY"] = api_key
+    os.environ["OPEN_TERMINAL_CORS_ALLOWED_ORIGINS"] = cors_allowed_origins
 
     click.echo(BANNER)
     if generated:
@@ -57,10 +108,41 @@ def run(host: str, port: int, api_key: str):
     type=click.Choice(["stdio", "streamable-http"]),
     help="MCP transport (default: stdio)",
 )
-@click.option("--host", default="0.0.0.0", help="Bind host (streamable-http only)")
-@click.option("--port", default=8000, type=int, help="Bind port (streamable-http only)")
-def mcp(transport: str, host: str, port: int):
+@click.option("--host", default=None, help="Bind host (streamable-http only)")
+@click.option(
+    "--port", default=None, type=int, help="Bind port (streamable-http only)"
+)
+@click.option(
+    "--config",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+    help="Path to a TOML config file (overrides user-level config location).",
+)
+@click.option(
+    "--cwd",
+    type=click.Path(exists=True, file_okay=False, resolve_path=True, path_type=str),
+    default=None,
+    help="Working directory for the server process.",
+)
+def mcp(
+    transport: str,
+    host: str | None,
+    port: int | None,
+    config_path: str | None,
+    cwd: str | None,
+):
     """Start the MCP server (requires 'pip install open-terminal[mcp]')."""
+    from open_terminal import config
+
+    cfg = config.init(config_path)
+
+    host = host or cfg.get("host", "0.0.0.0")
+    port = port if port is not None else cfg.get("port", 8000)
+
+    if cwd:
+        os.chdir(cwd)
+
     try:
         from open_terminal.mcp_server import mcp as mcp_server
     except ImportError:

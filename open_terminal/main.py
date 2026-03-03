@@ -1,5 +1,5 @@
 import asyncio
-import base64
+from importlib.metadata import version as _pkg_version
 import fnmatch
 import json
 
@@ -8,6 +8,7 @@ import aiofiles.os
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import sys
@@ -16,13 +17,26 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
-from open_terminal.env import API_KEY, LOG_DIR
+from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_TERMINAL, LOG_DIR, MAX_TERMINAL_SESSIONS, TERMINAL_TERM
+from open_terminal.runner import PipeRunner, ProcessRunner, create_runner
+
+try:
+    import fcntl
+    import pty
+    import struct
+    import subprocess
+    import termios
+
+    _PTY_AVAILABLE = True
+except ImportError:
+    _PTY_AVAILABLE = False  # Windows
 
 
 def get_system_info() -> str:
@@ -31,8 +45,7 @@ def get_system_info() -> str:
     return (
         f"This system is running {platform.system()} {platform.release()} ({platform.machine()}) "
         f"on {socket.gethostname()} as user '{os.getenv('USER', 'unknown')}' with {shell}. "
-        f"Python {sys.version.split()[0]} is available. "
-        f"The working directory is {os.getcwd()}."
+        f"Python {sys.version.split()[0]} is available."
     )
 
 
@@ -56,11 +69,11 @@ async def verify_api_key(
 app = FastAPI(
     title="Open Terminal",
     description="A remote terminal API.",
-    version="0.2.5",
+    version=_pkg_version("open-terminal"),
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in CORS_ALLOWED_ORIGINS.split(",")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -82,6 +95,7 @@ async def normalize_null_query_params(request: Request, call_next):
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+
 
 class ExecRequest(BaseModel):
     command: str = Field(
@@ -142,6 +156,24 @@ class ReplacementChunk(BaseModel):
     )
 
 
+class MkdirRequest(BaseModel):
+    path: str = Field(
+        ...,
+        description="Directory path to create. Parent directories are created automatically.",
+    )
+
+
+class MoveRequest(BaseModel):
+    source: str = Field(
+        ...,
+        description="Path to the file or directory to move.",
+    )
+    destination: str = Field(
+        ...,
+        description="Destination path (new location).",
+    )
+
+
 class ReplaceRequest(BaseModel):
     path: str = Field(
         ...,
@@ -153,15 +185,17 @@ class ReplaceRequest(BaseModel):
     )
 
 
+
 # ---------------------------------------------------------------------------
 # Background process management
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class BackgroundProcess:
     id: str
     command: str
-    process: asyncio.subprocess.Process
+    runner: ProcessRunner
     status: str = "running"
     exit_code: Optional[int] = None
     log_task: Optional[asyncio.Task] = field(default=None, repr=False)
@@ -174,18 +208,20 @@ _EXPIRY_SECONDS = 300  # auto-clean finished processes after 5 min
 
 
 async def _log_process(background_process: BackgroundProcess):
-    """Read stdout and stderr and persist to a log file."""
+    """Read process output and persist to a log file."""
     log_file = None
     try:
         if background_process.log_path:
-            await aiofiles.os.makedirs(os.path.dirname(background_process.log_path), exist_ok=True)
+            await aiofiles.os.makedirs(
+                os.path.dirname(background_process.log_path), exist_ok=True
+            )
             log_file = await aiofiles.open(background_process.log_path, "a")
             await log_file.write(
                 json.dumps(
                     {
                         "type": "start",
                         "command": background_process.command,
-                        "pid": background_process.process.pid,
+                        "pid": background_process.runner.pid,
                         "ts": time.time(),
                     }
                 )
@@ -195,27 +231,14 @@ async def _log_process(background_process: BackgroundProcess):
     except OSError:
         log_file = None
 
-    async def read_stream(stream, label):
-        async for line in stream:
-            if log_file:
-                await log_file.write(
-                    json.dumps(
-                        {"type": label, "data": line.decode(errors="replace"), "ts": time.time()}
-                    )
-                    + "\n"
-                )
-                await log_file.flush()
-
     try:
-        await asyncio.gather(
-            read_stream(background_process.process.stdout, "stdout"),
-            read_stream(background_process.process.stderr, "stderr"),
-        )
+        await background_process.runner.read_output(log_file)
     finally:
-        await background_process.process.wait()
-        background_process.exit_code = background_process.process.returncode
+        exit_code = await background_process.runner.wait()
+        background_process.exit_code = exit_code
         background_process.status = "done"
         background_process.finished_at = time.time()
+        background_process.runner.close()
         if log_file:
             await log_file.write(
                 json.dumps(
@@ -254,7 +277,7 @@ async def _read_log(
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if record.get("type") in ("stdout", "stderr"):
+        if record.get("type") in ("stdout", "stderr", "output"):
             entries.append({"type": record["type"], "data": record["data"]})
 
     total = len(entries)
@@ -293,6 +316,7 @@ def _get_process(process_id: str) -> BackgroundProcess:
 # Health
 # ---------------------------------------------------------------------------
 
+
 @app.get(
     "/health",
     operation_id="health_check",
@@ -304,8 +328,52 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
+# Config (capability discovery)
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/api/config",
+    include_in_schema=False,
+)
+async def get_config():
+    """Return server feature flags for client-side discovery."""
+    return {
+        "features": {
+            "terminal": ENABLE_TERMINAL,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Files
 # ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/files/cwd",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_cwd():
+    return {"cwd": os.getcwd()}
+
+
+@app.post(
+    "/files/cwd",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def set_cwd(request: MkdirRequest):
+    target = os.path.abspath(request.path)
+    if not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Directory not found")
+    try:
+        os.chdir(target)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"cwd": target}
+
 
 @app.get(
     "/files/list",
@@ -351,17 +419,22 @@ async def list_files(
     "/files/read",
     operation_id="read_file",
     summary="Read a file",
-    description="Return the contents of a file as JSON. Text files return a content string; binary files return base64-encoded content. Optionally specify a line range for text files.",
+    description="Return the contents of a file. Text files return JSON with a content string. Supported binary types (configurable, default: image/*) return the raw binary with the appropriate Content-Type. Unsupported binary types are rejected. Optionally specify a line range for text files. This returns file content to you but does not show anything to the user. Use display_file to let the user see a file.",
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "File not found."},
+        415: {"description": "Unsupported binary file type."},
         401: {"description": "Invalid or missing API key."},
     },
 )
 async def read_file(
     path: str = Query(..., description="Path to the file to read."),
-    start_line: Optional[int] = Query(None, description="First line to return (1-indexed, inclusive).", ge=1),
-    end_line: Optional[int] = Query(None, description="Last line to return (1-indexed, inclusive).", ge=1),
+    start_line: Optional[int] = Query(
+        None, description="First line to return (1-indexed, inclusive).", ge=1
+    ),
+    end_line: Optional[int] = Query(
+        None, description="Last line to return (1-indexed, inclusive).", ge=1
+    ),
 ):
     target = os.path.abspath(path)
     if not await aiofiles.os.path.isfile(target):
@@ -372,15 +445,36 @@ async def read_file(
             content = await f.read()
             lines = content.splitlines(keepends=True)
     except (UnicodeDecodeError, ValueError):
-        # Binary file — return base64
-        async with aiofiles.open(target, "rb") as f:
-            raw = await f.read()
-        return {
-            "path": target,
-            "encoding": "base64",
-            "size": len(raw),
-            "content": base64.b64encode(raw).decode("ascii"),
-        }
+        import mimetypes
+
+        size = (await aiofiles.os.stat(target)).st_size
+        mime, _ = mimetypes.guess_type(target)
+        mime = mime or "application/octet-stream"
+
+        # Extract text from PDFs so LLMs can read the content
+        if mime == "application/pdf":
+            reader = await asyncio.to_thread(PdfReader, target)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            lines = text.splitlines(keepends=True)
+            start = (start_line or 1) - 1
+            end = end_line or len(lines)
+            return {
+                "path": target,
+                "total_lines": len(lines),
+                "content": "".join(lines[start:end]),
+            }
+
+        # Return raw binary for allowed mime type prefixes (e.g. image/*)
+        if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
+            async with aiofiles.open(target, "rb") as f:
+                raw = await f.read()
+            return Response(content=raw, media_type=mime)
+
+        # Other binary files: reject (LLMs can't interpret raw bytes)
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported binary file type: {mime} ({size} bytes)",
+        )
 
     start = (start_line or 1) - 1
     end = end_line or len(lines)
@@ -389,6 +483,58 @@ async def read_file(
         "total_lines": len(lines),
         "content": "".join(lines[start:end]),
     }
+
+
+@app.get(
+    "/files/display",
+    operation_id="display_file",
+    summary="Display a file to the user",
+    description="Open a file in the user's file viewer so they can see it. Use this when the user wants to view or look at a file. This does not return file content to you — use read_file if you need to read the content yourself.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        401: {"description": "Invalid or missing API key."},
+    },
+)
+async def display_file(
+    path: str = Query(..., description="Absolute path to the file to display."),
+):
+    """Signal that a file should be displayed to the user.
+
+    This endpoint does not serve file content itself. It returns the resolved
+    path and whether the file exists. The consuming client is responsible for
+    intercepting this response and presenting the file in its own UI (e.g.
+    opening a preview pane, launching a viewer, etc.).
+    """
+    target = os.path.abspath(path)
+    exists = await aiofiles.os.path.isfile(target)
+    return {"path": target, "exists": exists}
+
+
+@app.get(
+    "/files/view",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def view_file(
+    path: str = Query(..., description="Path to the file to view."),
+):
+    """Return raw file bytes with the appropriate Content-Type.
+
+    Unlike read_file (which is designed for LLM consumption and restricts
+    binary types), this endpoint serves any file as-is for UI previewing.
+    """
+    target = os.path.abspath(path)
+    if not await aiofiles.os.path.isfile(target):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    import mimetypes
+
+    mime, _ = mimetypes.guess_type(target)
+    mime = mime or "application/octet-stream"
+
+    async with aiofiles.open(target, "rb") as f:
+        raw = await f.read()
+    return Response(content=raw, media_type=mime)
 
 
 @app.post(
@@ -410,6 +556,69 @@ async def write_file(request: WriteRequest):
     except OSError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"path": target, "size": len(request.content.encode())}
+
+
+@app.post(
+    "/files/mkdir",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def mkdir(request: MkdirRequest):
+    target = os.path.abspath(request.path)
+    try:
+        await aiofiles.os.makedirs(target, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"path": target}
+
+
+@app.delete(
+    "/files/delete",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def delete_entry(
+    path: str = Query(..., description="Path to delete."),
+):
+    target = os.path.abspath(path)
+    if not await aiofiles.os.path.exists(target):
+        raise HTTPException(status_code=404, detail="Path not found")
+
+    is_dir = await aiofiles.os.path.isdir(target)
+    try:
+        if is_dir:
+            await asyncio.to_thread(shutil.rmtree, target)
+        else:
+            await aiofiles.os.remove(target)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"path": target, "type": "directory" if is_dir else "file"}
+
+
+@app.post(
+    "/files/move",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def move_entry(request: MoveRequest):
+    source = os.path.abspath(request.source)
+    destination = os.path.abspath(request.destination)
+
+    if not await aiofiles.os.path.exists(source):
+        raise HTTPException(status_code=404, detail="Source path not found")
+
+    dest_parent = os.path.dirname(destination)
+    if not await aiofiles.os.path.isdir(dest_parent):
+        raise HTTPException(status_code=400, detail="Destination parent directory not found")
+
+    if await aiofiles.os.path.exists(destination):
+        raise HTTPException(status_code=409, detail="Destination already exists")
+
+    try:
+        await asyncio.to_thread(shutil.move, source, destination)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"source": source, "destination": destination}
 
 
 @app.post(
@@ -473,8 +682,8 @@ async def replace_file_content(request: ReplaceRequest):
 
 
 @app.get(
-    "/files/search",
-    operation_id="search_files",
+    "/files/grep",
+    operation_id="grep_search",
     summary="Search file contents",
     description="Search for a text pattern across files in a directory. Returns structured matches with file paths, line numbers, and matching lines. Skips binary files.",
     dependencies=[Depends(verify_api_key)],
@@ -484,14 +693,24 @@ async def replace_file_content(request: ReplaceRequest):
         401: {"description": "Invalid or missing API key."},
     },
 )
-async def search_files(
+async def grep_search(
     query: str = Query(..., description="Text or regex pattern to search for."),
     path: str = Query(".", description="Directory or file to search in."),
     regex: bool = Query(False, description="Treat query as a regex pattern."),
-    case_insensitive: bool = Query(False, description="Perform case-insensitive matching."),
-    include: Optional[list[str]] = Query(None, description="Glob patterns to filter files (e.g. '*.py'). Files must match at least one pattern."),
-    match_per_line: bool = Query(True, description="If true, return each matching line with line numbers. If false, return only the names of matching files."),
-    max_results: int = Query(50, description="Maximum number of matches to return.", ge=1, le=500),
+    case_insensitive: bool = Query(
+        False, description="Perform case-insensitive matching."
+    ),
+    include: Optional[list[str]] = Query(
+        None,
+        description="Glob patterns to filter files (e.g. '*.py'). Files must match at least one pattern.",
+    ),
+    match_per_line: bool = Query(
+        True,
+        description="If true, return each matching line with line numbers. If false, return only the names of matching files.",
+    ),
+    max_results: int = Query(
+        50, description="Maximum number of matches to return.", ge=1, le=500
+    ),
 ):
     target = os.path.abspath(path)
     if not await aiofiles.os.path.exists(target):
@@ -524,11 +743,13 @@ async def search_files(
                     for line_number, line in enumerate(f, 1):
                         if pattern.search(line):
                             if match_per_line:
-                                matches.append({
-                                    "file": file_path,
-                                    "line": line_number,
-                                    "content": line.rstrip("\n\r"),
-                                })
+                                matches.append(
+                                    {
+                                        "file": file_path,
+                                        "line": line_number,
+                                        "content": line.rstrip("\n\r"),
+                                    }
+                                )
                                 if len(matches) >= max_results:
                                     truncated = True
                                     return
@@ -562,57 +783,103 @@ async def search_files(
     }
 
 
-# Temporary links: {token: (path, expiry_timestamp)}
-_download_links: dict[str, tuple[str, float]] = {}
-_upload_links: dict[str, tuple[str, float]] = {}
-
-
 @app.get(
-    "/files/download/link",
-    operation_id="create_download_link",
-    summary="Get a file download link",
-    description="Returns a temporary download URL for a file. Link expires after 5 minutes and requires no authentication to use.",
+    "/files/glob",
+    operation_id="glob_search",
+    summary="Search files by name",
+    description="Search for files and subdirectories by name within a specified directory using glob patterns. Results will include the relative path, type, size, and modification time.",
     dependencies=[Depends(verify_api_key)],
     responses={
-        404: {"description": "File not found."},
+        404: {"description": "Search directory not found."},
         401: {"description": "Invalid or missing API key."},
     },
 )
-async def get_file_link(
-    path: str = Query(..., description="Absolute path to the file."),
-    request: Request = None,
+async def glob_search(
+    pattern: str = Query(..., description="Glob pattern to search for (e.g. '*.py')."),
+    path: str = Query(".", description="Directory to search within."),
+    exclude: Optional[list[str]] = Query(
+        None, description="Glob patterns to exclude from search results."
+    ),
+    type: Optional[str] = Query(
+        "any",
+        description="Type filter: 'file', 'directory', or 'any'.",
+        pattern="^(file|directory|any)$",
+    ),
+    max_results: int = Query(
+        50, description="Maximum number of matches to return.", ge=1, le=500
+    ),
 ):
-    if not await aiofiles.os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="File not found")
+    target = os.path.abspath(path)
+    if not await aiofiles.os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Search directory not found")
 
-    token = uuid.uuid4().hex
-    _download_links[token] = (path, time.time() + 300)
+    def _glob_sync():
+        matches = []
+        truncated = False
 
-    base_url = str(request.base_url).rstrip("/")
-    return {"url": f"{base_url}/files/download/{token}"}
+        for dirpath, dirnames, filenames in os.walk(target):
+            if truncated:
+                break
+
+            entries = []
+            if type in ("any", "directory"):
+                entries.extend([(d, "directory") for d in dirnames])
+            if type in ("any", "file"):
+                entries.extend([(f, "file") for f in filenames])
+
+            for name, entry_type in sorted(entries, key=lambda x: x[0]):
+                if truncated:
+                    break
+
+                full_path = os.path.join(dirpath, name)
+                rel_path = os.path.relpath(full_path, target)
+
+                # Check inclusion pattern
+                if not fnmatch.fnmatch(name, pattern) and not fnmatch.fnmatch(
+                    rel_path, pattern
+                ):
+                    continue
+
+                # Check exclusion patterns
+                if exclude and any(
+                    fnmatch.fnmatch(name, excl) or fnmatch.fnmatch(rel_path, excl)
+                    for excl in exclude
+                ):
+                    continue
+
+                try:
+                    file_stat = os.stat(full_path)
+                    matches.append(
+                        {
+                            "path": rel_path,
+                            "type": entry_type,
+                            "size": file_stat.st_size,
+                            "modified": file_stat.st_mtime,
+                        }
+                    )
+
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+                except OSError:
+                    pass
+
+        return matches, truncated
+
+    matches, truncated = await asyncio.to_thread(_glob_sync)
+    return {
+        "pattern": pattern,
+        "path": target,
+        "matches": matches,
+        "truncated": truncated,
+    }
 
 
-@app.get(
-    "/files/download/{token}",
-    include_in_schema=False,
-)
-async def download_file(token: str):
-    entry = _download_links.pop(token, None)
-    if not entry:
-        raise HTTPException(status_code=404, detail="Invalid or expired download link")
-
-    path, expiry = entry
-    if time.time() > expiry:
-        raise HTTPException(status_code=404, detail="Download link expired")
-
-    if not await aiofiles.os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(path)
 
 
 @app.post(
     "/files/upload",
+    include_in_schema=False,
     operation_id="upload_file",
     summary="Upload a file",
     description="Save a file to the specified path. Provide a `url` to fetch remotely, or send the file directly via multipart form data.",
@@ -623,8 +890,13 @@ async def download_file(token: str):
 )
 async def upload_file(
     directory: str = Query(..., description="Destination directory for the file."),
-    url: Optional[str] = Query(None, description="URL to download the file from. If omitted, expects a multipart file upload."),
-    file: Optional[UploadFile] = File(None, description="The file to upload (if no URL provided)."),
+    url: Optional[str] = Query(
+        None,
+        description="URL to download the file from. If omitted, expects a multipart file upload.",
+    ),
+    file: Optional[UploadFile] = File(
+        None, description="The file to upload (if no URL provided)."
+    ),
 ):
     if url:
         import httpx
@@ -639,7 +911,9 @@ async def upload_file(
         content = await file.read()
         filename = file.filename or "upload"
     else:
-        raise HTTPException(status_code=400, detail="Provide either 'url' or a file upload.")
+        raise HTTPException(
+            status_code=400, detail="Provide either 'url' or a file upload."
+        )
 
     try:
         await aiofiles.os.makedirs(directory, exist_ok=True)
@@ -651,76 +925,12 @@ async def upload_file(
     return {"path": path, "size": len(content)}
 
 
-@app.post(
-    "/files/upload/link",
-    operation_id="create_upload_link",
-    summary="Create an upload link",
-    description="Generate a temporary, unauthenticated upload URL. Link expires after 5 minutes.",
-    dependencies=[Depends(verify_api_key)],
-    responses={
-        401: {"description": "Invalid or missing API key."},
-    },
-)
-async def create_upload_link(
-    directory: str = Query(..., description="Destination directory for the uploaded file."),
-    request: Request = None,
-):
-    token = uuid.uuid4().hex
-    _upload_links[token] = (directory, time.time() + 300)
-
-    base_url = str(request.base_url).rstrip("/")
-    return {"url": f"{base_url}/files/upload/{token}"}
-
-
-@app.get(
-    "/files/upload/{token}",
-    response_class=HTMLResponse,
-    include_in_schema=False,
-)
-async def upload_page(token: str):
-    entry = _upload_links.get(token)
-    if not entry or time.time() > entry[1]:
-        return HTMLResponse("Link expired.", status_code=404)
-
-    return HTMLResponse(
-        '<form method="post" enctype="multipart/form-data">'
-        '<input type="file" name="file" required> '
-        '<button type="submit">Upload</button>'
-        '</form>'
-    )
-
-
-@app.post(
-    "/files/upload/{token}",
-    include_in_schema=False,
-)
-async def upload_file_via_link(
-    token: str,
-    file: UploadFile = File(..., description="The file to upload."),
-):
-    entry = _upload_links.pop(token, None)
-    if not entry:
-        raise HTTPException(status_code=404, detail="Invalid or expired upload link")
-
-    directory, expiry = entry
-    if time.time() > expiry:
-        raise HTTPException(status_code=404, detail="Upload link expired")
-
-    filename = file.filename or "upload"
-    try:
-        await aiofiles.os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, filename)
-        content = await file.read()
-        async with aiofiles.open(path, "wb") as f:
-            await f.write(content)
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"path": path, "size": len(content)}
 
 
 # ---------------------------------------------------------------------------
 # Execute
 # ---------------------------------------------------------------------------
+
 
 @app.get(
     "/execute",
@@ -771,23 +981,14 @@ async def execute(
     ),
 ):
     subprocess_env = {**os.environ, **request.env} if request.env else None
-    process = await asyncio.create_subprocess_shell(
-        request.command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.PIPE,
-        cwd=request.cwd,
-        env=subprocess_env,
-    )
+    runner = await create_runner(request.command, request.cwd, subprocess_env)
 
     process_id = uuid.uuid4().hex[:12]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
     background_process = BackgroundProcess(
-        id=process_id, command=request.command, process=process, log_path=log_path
+        id=process_id, command=request.command, runner=runner, log_path=log_path
     )
-    background_process.log_task = asyncio.create_task(
-        _log_process(background_process)
-    )
+    background_process.log_task = asyncio.create_task(_log_process(background_process))
     _processes[process_id] = background_process
 
     if wait is not None:
@@ -846,7 +1047,7 @@ async def get_status(
 ):
     background_process = _get_process(process_id)
 
-    if wait and background_process.status == "running":
+    if wait is not None and background_process.status == "running":
         try:
             await asyncio.wait_for(
                 asyncio.shield(background_process.log_task), timeout=wait
@@ -887,10 +1088,15 @@ async def send_input(process_id: str, body: InputRequest):
     if background_process.status != "running":
         raise HTTPException(status_code=400, detail="Process has already exited")
 
+    # Convert literal escape sequences (\n, \x03 for Ctrl-C, etc.) into real
+    # characters — LLMs often emit these as literal strings.
+    text = body.input.encode("raw_unicode_escape").decode("unicode_escape")
+
     try:
-        background_process.process.stdin.write(body.input.encode())
-        await background_process.process.stdin.drain()
-    except (BrokenPipeError, ConnectionResetError):
+        background_process.runner.write_input(text.encode())
+        if isinstance(background_process.runner, PipeRunner):
+            await background_process.runner.drain_input()
+    except (BrokenPipeError, ConnectionResetError, OSError):
         raise HTTPException(status_code=400, detail="Process stdin is closed")
 
     return {"status": "ok"}
@@ -913,12 +1119,360 @@ async def kill_process(
 ):
     background_process = _get_process(process_id)
     if background_process.status == "running":
-        if force:
-            background_process.process.kill()
-        else:
-            background_process.process.send_signal(signal.SIGTERM)
-        await background_process.process.wait()
+        background_process.runner.kill(force=force)
+        exit_code = await background_process.runner.wait()
+        background_process.runner.close()
         background_process.status = "killed"
-        background_process.exit_code = background_process.process.returncode
+        background_process.exit_code = exit_code
     del _processes[process_id]
     return {"status": "killed"}
+
+
+# ---------------------------------------------------------------------------
+# Interactive terminal sessions (resource-oriented API)
+# ---------------------------------------------------------------------------
+
+if ENABLE_TERMINAL:
+
+    import uuid as _uuid
+    from datetime import datetime as _datetime
+    from fastapi.responses import JSONResponse
+
+    try:
+        import select as _select
+    except ImportError:
+        _select = None  # Not available on all platforms in all contexts
+
+    # Determine terminal backend: prefer Unix PTY, then pywinpty, else None
+    if _PTY_AVAILABLE:
+        _TERMINAL_BACKEND = "pty"
+    else:
+        try:
+            from winpty import PtyProcess as _WinPtyProcess
+
+            _TERMINAL_BACKEND = "winpty"
+        except ImportError:
+            _TERMINAL_BACKEND = None
+
+    # Active terminal sessions: {id: {...}}
+    _terminal_sessions: dict[str, dict] = {}
+
+
+    def _cleanup_session(session_id: str):
+        """Clean up a terminal session's resources."""
+        session = _terminal_sessions.pop(session_id, None)
+        if session is None:
+            return
+
+        backend = session.get("backend")
+
+        if backend == "pty":
+            try:
+                os.close(session["master_fd"])
+            except OSError:
+                pass
+            process = session["process"]
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+        elif backend == "winpty":
+            pty_proc = session["pty_process"]
+            if pty_proc.isalive():
+                pty_proc.terminate()
+
+
+    @app.post("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+    async def create_terminal(request: Request):
+        """Create a new terminal session and return its ID."""
+        if _TERMINAL_BACKEND is None:
+            return JSONResponse(
+                {"error": "PTY not available on this platform (install pywinpty on Windows)"},
+                status_code=503,
+            )
+
+        # Prune dead sessions before checking limit
+        if _TERMINAL_BACKEND == "pty":
+            dead = [sid for sid, s in _terminal_sessions.items() if s["process"].poll() is not None]
+        else:
+            dead = [sid for sid, s in _terminal_sessions.items() if not s["pty_process"].isalive()]
+        for sid in dead:
+            _cleanup_session(sid)
+
+        if len(_terminal_sessions) >= MAX_TERMINAL_SESSIONS:
+            return JSONResponse(
+                {"error": f"Maximum number of terminal sessions ({MAX_TERMINAL_SESSIONS}) reached"},
+                status_code=429,
+            )
+
+        session_id = str(_uuid.uuid4())[:8]
+
+        if _TERMINAL_BACKEND == "pty":
+            try:
+                master_fd, slave_fd = pty.openpty()
+            except OSError:
+                return JSONResponse(
+                    {"error": "Out of PTY devices — too many active terminals or processes"},
+                    status_code=503,
+                )
+
+            try:
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+
+                shell = os.environ.get("SHELL", "/bin/sh")
+                spawn_env = os.environ.copy()
+                spawn_env.setdefault("TERM", TERMINAL_TERM)
+                process = subprocess.Popen(
+                    [shell],
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    cwd=os.getcwd(),
+                    env=spawn_env,
+                    start_new_session=True,
+                )
+            except Exception:
+                os.close(slave_fd)
+                os.close(master_fd)
+                raise
+            os.close(slave_fd)
+
+            # Set non-blocking
+            flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+            _terminal_sessions[session_id] = {
+                "backend": "pty",
+                "master_fd": master_fd,
+                "process": process,
+                "created_at": _datetime.utcnow().isoformat() + "Z",
+                "pid": process.pid,
+            }
+
+        else:  # winpty
+            shell = os.environ.get("COMSPEC", "cmd.exe")
+            spawn_env = os.environ.copy()
+            spawn_env.setdefault("TERM", TERMINAL_TERM)
+            pty_proc = _WinPtyProcess.spawn(
+                [shell],
+                cwd=os.getcwd(),
+                env=spawn_env,
+                dimensions=(24, 80),
+            )
+            _terminal_sessions[session_id] = {
+                "backend": "winpty",
+                "pty_process": pty_proc,
+                "created_at": _datetime.utcnow().isoformat() + "Z",
+                "pid": pty_proc.pid,
+            }
+
+        session = _terminal_sessions[session_id]
+        return {
+            "id": session_id,
+            "created_at": session["created_at"],
+            "pid": session["pid"],
+        }
+
+
+    def _session_is_alive(session: dict) -> bool:
+        """Check if a terminal session's process is still running."""
+        if session["backend"] == "pty":
+            return session["process"].poll() is None
+        else:
+            return session["pty_process"].isalive()
+
+
+    @app.get("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+    async def list_terminals(request: Request):
+        """List active terminal sessions."""
+        result = []
+        to_remove = []
+        for sid, session in _terminal_sessions.items():
+            if not _session_is_alive(session):
+                to_remove.append(sid)
+                continue
+            result.append({
+                "id": sid,
+                "created_at": session["created_at"],
+                "pid": session["pid"],
+            })
+        for sid in to_remove:
+            _cleanup_session(sid)
+        return result
+
+
+    @app.get("/api/terminals/{session_id}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+    async def get_terminal(session_id: str, request: Request):
+        """Get info about a terminal session."""
+        session = _terminal_sessions.get(session_id)
+        if session is None:
+            return JSONResponse({"error": "Session not found"}, status_code=404)
+        if not _session_is_alive(session):
+            _cleanup_session(session_id)
+            return JSONResponse({"error": "Session not found"}, status_code=404)
+        return {
+            "id": session_id,
+            "created_at": session["created_at"],
+            "pid": session["pid"],
+        }
+
+
+    @app.delete("/api/terminals/{session_id}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+    async def delete_terminal(session_id: str, request: Request):
+        """Kill and remove a terminal session."""
+        if session_id not in _terminal_sessions:
+            return JSONResponse({"error": "Session not found"}, status_code=404)
+        _cleanup_session(session_id)
+        return {"status": "deleted"}
+
+
+    @app.websocket("/api/terminals/{session_id}")
+    async def ws_terminal(ws: WebSocket, session_id: str):
+        """Attach to an existing terminal session via WebSocket.
+
+        Authentication is via **first-message auth**: after connecting, the client
+        must send a JSON text frame as its first message::
+
+            {"type": "auth", "token": "<api_key>"}
+
+        The server validates the token and closes the connection if invalid.
+        After authentication, the client sends keystrokes as **binary** frames
+        and receives PTY output as binary frames.
+
+        To resize, send a **text** JSON frame::
+
+            {"type": "resize", "cols": 120, "rows": 40}
+        """
+        session = _terminal_sessions.get(session_id)
+        if session is None:
+            await ws.close(code=4004, reason="Session not found")
+            return
+
+        if not _session_is_alive(session):
+            _cleanup_session(session_id)
+            await ws.close(code=4004, reason="Session has ended")
+            return
+
+        await ws.accept()
+
+        # First-message authentication
+        if API_KEY:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
+                payload = json.loads(msg)
+                if payload.get("type") != "auth" or payload.get("token") != API_KEY:
+                    await ws.close(code=4001, reason="Invalid API key")
+                    return
+            except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+                await ws.close(code=4001, reason="Auth timeout or invalid payload")
+                return
+
+        backend = session["backend"]
+        loop = asyncio.get_event_loop()
+        stop_event = asyncio.Event()
+
+        # --- Platform-specific read/write/resize helpers ---
+
+        if backend == "pty":
+            master_fd = session["master_fd"]
+            process = session["process"]
+
+            def _blocking_read():
+                """Read from PTY using select() so we don't block forever."""
+                while not stop_event.is_set():
+                    try:
+                        rlist, _, _ = _select.select([master_fd], [], [], 0.1)
+                        if rlist:
+                            return os.read(master_fd, 4096)
+                    except (OSError, ValueError):
+                        return b""
+                return b""
+
+            def _check_alive():
+                return process.poll() is None
+
+            def _write_data(data: bytes):
+                os.write(master_fd, data)
+
+            def _do_resize(rows: int, cols: int):
+                fcntl.ioctl(
+                    master_fd,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0),
+                )
+
+        else:  # winpty
+            pty_proc = session["pty_process"]
+
+            def _blocking_read():
+                """Read from WinPTY process."""
+                try:
+                    data = pty_proc.read(4096)
+                    return data.encode(errors="replace") if data else b""
+                except EOFError:
+                    return b""
+                except Exception:
+                    return b""
+
+            def _check_alive():
+                return pty_proc.isalive()
+
+            def _write_data(data: bytes):
+                pty_proc.write(data.decode(errors="replace"))
+
+            def _do_resize(rows: int, cols: int):
+                pty_proc.setwinsize(rows, cols)
+
+        # --- Reader / writer tasks ---
+
+        async def _pty_reader():
+            """Forward PTY output -> WebSocket."""
+            try:
+                while not stop_event.is_set():
+                    data = await loop.run_in_executor(None, _blocking_read)
+                    if not data:
+                        if stop_event.is_set():
+                            break
+                        if not _check_alive():
+                            break
+                        continue
+                    try:
+                        await ws.send_bytes(data)
+                    except Exception:
+                        break
+            finally:
+                pass
+
+        reader_task = asyncio.create_task(_pty_reader())
+
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                elif "bytes" in msg and msg["bytes"]:
+                    await loop.run_in_executor(None, _write_data, msg["bytes"])
+                elif "text" in msg and msg["text"]:
+                    try:
+                        payload = json.loads(msg["text"])
+                        if payload.get("type") == "resize":
+                            cols = payload.get("cols", 80)
+                            rows = payload.get("rows", 24)
+                            _do_resize(rows, cols)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        except WebSocketDisconnect:
+            pass
+        finally:
+            stop_event.set()
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            # Clean up session on disconnect
+            _cleanup_session(session_id)
+

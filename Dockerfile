@@ -65,8 +65,9 @@ RUN pip install --no-cache-dir \
 COPY . .
 RUN pip install --no-cache-dir .
 
-RUN useradd -m user && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+RUN useradd -m -s /bin/bash user && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 USER user
+ENV SHELL=/bin/bash
 WORKDIR /home/user
 
 EXPOSE 8000
